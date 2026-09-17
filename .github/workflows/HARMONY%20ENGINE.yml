@@ -8,8 +8,8 @@ on:
 
 jobs:
   build-macos-intel:
-    name: Build Intel VST3 - macOS 10.15
-    runs-on: macos-13
+    name: Build Intel VST3 - macOS 10.15 target
+    runs-on: macos-15-intel
 
     env:
       MACOSX_DEPLOYMENT_TARGET: "10.15"
@@ -18,71 +18,76 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Configure CMake
+      - name: Verify Intel runner
+        shell: bash
         run: |
+          set -euo pipefail
+          sw_vers
+          uname -m
+          test "$(uname -m)" = "x86_64"
+
+      - name: Configure CMake
+        shell: bash
+        run: |
+          set -euo pipefail
           cmake -S . -B build \
             -DCMAKE_BUILD_TYPE=Release \
             -DHARMONY_BUILD_PLUGIN=ON \
             -DCMAKE_OSX_ARCHITECTURES=x86_64 \
-            -DCMAKE_OSX_DEPLOYMENT_TARGET=10.15
+            -DCMAKE_OSX_DEPLOYMENT_TARGET=10.15 \
+            -DCMAKE_OSX_SYSROOT=macosx
 
       - name: Build Harmony Engine
+        shell: bash
         run: |
+          set -euo pipefail
           cmake --build build --config Release --parallel 2
 
       - name: Run DSP tests
-        run: |
-          ctest --test-dir build --output-on-failure -C Release
-
-      - name: Verify VST3 exists
         shell: bash
         run: |
-          set -e
-          echo "Searching for built VST3..."
-          find build -type d -name "*.vst3" -print
+          set -euo pipefail
+          ctest --test-dir build --output-on-failure -C Release
 
-          VST3_PATH="$(find build -type d -name "*.vst3" | head -n 1)"
+      - name: Locate VST3
+        shell: bash
+        run: |
+          set -euo pipefail
+          VST3_PATH="$(find build -type d -name "*.vst3" | head -n 1 || true)"
           if [ -z "$VST3_PATH" ]; then
             echo "ERROR: No VST3 bundle was produced."
             exit 1
           fi
-
           echo "VST3_PATH=$VST3_PATH" >> "$GITHUB_ENV"
 
-      - name: Verify Intel architecture
+      - name: Verify Intel VST3 binary
         shell: bash
         run: |
-          set -e
-
-          BIN="$(find "$VST3_PATH/Contents/MacOS" -type f | head -n 1)"
+          set -euo pipefail
+          BIN="$(find "$VST3_PATH/Contents/MacOS" -type f | head -n 1 || true)"
           if [ -z "$BIN" ]; then
             echo "ERROR: VST3 executable was not found."
             exit 1
           fi
-
-          echo "Plugin binary:"
           file "$BIN"
-
           file "$BIN" | grep -q "x86_64" || {
-            echo "ERROR: Plugin is not Intel x86_64."
+            echo "ERROR: VST3 is not Intel x86_64."
             exit 1
           }
+          echo "BIN=$BIN" >> "$GITHUB_ENV"
 
       - name: Verify macOS deployment target
         shell: bash
         run: |
-          set -e
-
-          BIN="$(find "$VST3_PATH/Contents/MacOS" -type f | head -n 1)"
-          echo "Load commands:"
-          otool -l "$BIN" | grep -A 6 -E "LC_BUILD_VERSION|LC_VERSION_MIN_MACOSX" || true
+          set -euo pipefail
+          otool -l "$BIN" | grep -A 8 -E "LC_BUILD_VERSION|LC_VERSION_MIN_MACOSX" || true
 
       - name: Package VST3
         shell: bash
         run: |
-          set -e
+          set -euo pipefail
           mkdir -p dist
-          ditto -c -k --sequesterRsrc --keepParent "$VST3_PATH" "dist/HARMONY-ENGINE-macOS-Intel-VST3.zip"
+          ditto -c -k --sequesterRsrc --keepParent             "$VST3_PATH"             "dist/HARMONY-ENGINE-macOS-Intel-VST3.zip"
 
       - name: Upload VST3 artifact
         uses: actions/upload-artifact@v4
