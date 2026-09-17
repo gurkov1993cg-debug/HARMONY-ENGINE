@@ -1,0 +1,93 @@
+name: HARMONY ENGINE
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+jobs:
+  build-macos-intel:
+    name: Build Intel VST3 - macOS 10.15
+    runs-on: macos-13
+
+    env:
+      MACOSX_DEPLOYMENT_TARGET: "10.15"
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Configure CMake
+        run: |
+          cmake -S . -B build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DHARMONY_BUILD_PLUGIN=ON \
+            -DCMAKE_OSX_ARCHITECTURES=x86_64 \
+            -DCMAKE_OSX_DEPLOYMENT_TARGET=10.15
+
+      - name: Build Harmony Engine
+        run: |
+          cmake --build build --config Release --parallel 2
+
+      - name: Run DSP tests
+        run: |
+          ctest --test-dir build --output-on-failure -C Release
+
+      - name: Verify VST3 exists
+        shell: bash
+        run: |
+          set -e
+          echo "Searching for built VST3..."
+          find build -type d -name "*.vst3" -print
+
+          VST3_PATH="$(find build -type d -name "*.vst3" | head -n 1)"
+          if [ -z "$VST3_PATH" ]; then
+            echo "ERROR: No VST3 bundle was produced."
+            exit 1
+          fi
+
+          echo "VST3_PATH=$VST3_PATH" >> "$GITHUB_ENV"
+
+      - name: Verify Intel architecture
+        shell: bash
+        run: |
+          set -e
+
+          BIN="$(find "$VST3_PATH/Contents/MacOS" -type f | head -n 1)"
+          if [ -z "$BIN" ]; then
+            echo "ERROR: VST3 executable was not found."
+            exit 1
+          fi
+
+          echo "Plugin binary:"
+          file "$BIN"
+
+          file "$BIN" | grep -q "x86_64" || {
+            echo "ERROR: Plugin is not Intel x86_64."
+            exit 1
+          }
+
+      - name: Verify macOS deployment target
+        shell: bash
+        run: |
+          set -e
+
+          BIN="$(find "$VST3_PATH/Contents/MacOS" -type f | head -n 1)"
+          echo "Load commands:"
+          otool -l "$BIN" | grep -A 6 -E "LC_BUILD_VERSION|LC_VERSION_MIN_MACOSX" || true
+
+      - name: Package VST3
+        shell: bash
+        run: |
+          set -e
+          mkdir -p dist
+          ditto -c -k --sequesterRsrc --keepParent "$VST3_PATH" "dist/HARMONY-ENGINE-macOS-Intel-VST3.zip"
+
+      - name: Upload VST3 artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: HARMONY-ENGINE-macOS-Intel-VST3
+          path: dist/HARMONY-ENGINE-macOS-Intel-VST3.zip
+          if-no-files-found: error
+          retention-days: 30
