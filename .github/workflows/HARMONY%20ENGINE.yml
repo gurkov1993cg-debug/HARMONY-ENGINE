@@ -18,8 +18,10 @@ concurrency:
 jobs:
   build:
     runs-on: macos-15-intel
+    timeout-minutes: 35
     env:
-      MACOSX_DEPLOYMENT_TARGET: "10.15"
+      MACOSX_DEPLOYMENT_TARGET: '10.15'
+      VST3SDK_COMMIT: '3cdf9ca5d1f5b1b21e0a86832aa4abe55607bd96'
 
     steps:
       - name: Checkout
@@ -30,22 +32,24 @@ jobs:
         run: |
           set -euo pipefail
           test -f HARMONY-ENGINE.zip || { echo 'HARMONY-ENGINE.zip not found'; exit 1; }
-
           rm -rf harmony-src
           mkdir -p harmony-src
           ditto -x -k HARMONY-ENGINE.zip harmony-src
-
           ROOT="$(find harmony-src -maxdepth 3 -name CMakeLists.txt -print -quit | xargs dirname)"
           test -n "$ROOT" || { echo 'CMake root not found'; exit 1; }
-
           echo "PROJECT_ROOT=$ROOT" >> "$GITHUB_ENV"
           echo "Project root: $ROOT"
+
+          if grep -RniE 'juce::|JuceHeader|juce_audio|juce_gui|JUCE_CALLTYPE' "$ROOT/core" "$ROOT/plugin"; then
+            echo 'ERROR: forbidden JUCE dependency found in active HARMONY ENGINE source.'
+            exit 1
+          fi
 
       - name: Checkout Steinberg VST3 SDK 3.8.1
         uses: actions/checkout@v5
         with:
           repository: steinbergmedia/vst3sdk
-          ref: 3cdf9ca5d1f5b1b21e0a86832aa4abe55607bd96
+          ref: ${{ env.VST3SDK_COMMIT }}
           path: vst3sdk
           submodules: recursive
 
@@ -64,68 +68,92 @@ jobs:
       - name: Run C++ tests
         run: ctest --test-dir build-tests -C Release --output-on-failure
 
-      - name: Configure Intel VST3 and GUI
+      - name: Configure Intel VST3 with Xcode
         shell: bash
         run: |
           cmake -S "$PROJECT_ROOT" -B build-vst3 -G Xcode \
             -DHARMONY_BUILD_PLUGIN=ON \
             -DVST3_SDK_ROOT="$GITHUB_WORKSPACE/vst3sdk" \
             -DSMTG_BUILD_UNIVERSAL_BINARY=OFF \
+            -DSMTG_CREATE_PLUGIN_LINK=OFF \
             -DCMAKE_OSX_ARCHITECTURES=x86_64 \
-            -DCMAKE_OSX_DEPLOYMENT_TARGET=10.15 \
-            -DSMTG_CREATE_PLUGIN_LINK=OFF
+            -DCMAKE_OSX_DEPLOYMENT_TARGET=10.15
 
       - name: Build VST3
         run: cmake --build build-vst3 --config Release --target HarmonyEngine --parallel 4
 
-      - name: Verify Intel and macOS target
+      - name: Finalize and validate real VST3 package
         shell: bash
         run: |
           set -euo pipefail
 
           VST="$(find build-vst3 -type d -name 'HarmonyEngine.vst3' -print -quit)"
-          test -n "$VST" || { echo 'HarmonyEngine.vst3 not produced'; exit 1; }
+          test -n "$VST" || { echo 'HarmonyEngine.vst3 was not produced'; exit 1; }
 
           BIN="$VST/Contents/MacOS/HarmonyEngine"
+          PLIST="$VST/Contents/Info.plist"
           test -f "$BIN" || { echo 'VST3 executable not found'; exit 1; }
+          test -f "$PLIST" || { echo 'Info.plist not found'; exit 1; }
 
           file "$BIN" | tee binary-info.txt
-          file "$BIN" | grep -q 'x86_64'
+          ARCHS="$(lipo -archs "$BIN")"
+          echo "Architectures: $ARCHS"
+          test "$ARCHS" = 'x86_64' || { echo "ERROR: expected x86_64 only, got: $ARCHS"; exit 1; }
 
           xcrun vtool -show-build "$BIN" | tee deployment-info.txt
+          MINOS="$(awk '$1=="minos"{print $2; exit} /LC_VERSION_MIN_MACOSX/{legacy=1; next} legacy && $1=="version"{print $2; exit}' deployment-info.txt)"
+          test -n "$MINOS" || { echo 'Could not determine deployment target'; exit 1; }
+          awk -v v="$MINOS" 'BEGIN { split(v,a,"."); if ((a[1]+0)>10 || ((a[1]+0)==10 && (a[2]+0)>15)) exit 1; }' \
+            || { echo "ERROR: deployment target $MINOS is newer than macOS 10.15"; exit 1; }
 
-          /usr/libexec/PlistBuddy -c 'Print :CFBundlePackageType' "$VST/Contents/Info.plist" | grep -q '^BNDL$'
-          /usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$VST/Contents/Info.plist" | grep -q '^com.tercior.harmonyengine$'
+          plutil -lint "$PLIST"
+          test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundlePackageType' "$PLIST")" = 'BNDL'
+          test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$PLIST")" = 'com.tercior.harmonyengine'
+          test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$PLIST")" = 'HarmonyEngine'
+          test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleName' "$PLIST")" = 'Harmony Engine'
+          test "$(/usr/libexec/PlistBuddy -c 'Print :LSMinimumSystemVersion' "$PLIST")" = '10.15'
 
+          # PkgInfo makes the bundle identity explicit for older Finder/LaunchServices.
+          printf 'BNDLVST3' > "$VST/Contents/PkgInfo"
+
+          # Any bundle metadata change invalidates the previous ad-hoc signature.
+          codesign --force --deep --sign - "$VST"
           codesign --verify --deep --strict --verbose=2 "$VST"
+
+          VALIDATOR="$(find build-vst3 -type f -name validator -perm +111 -print -quit || true)"
+          test -n "$VALIDATOR" || { echo 'Steinberg validator not found'; exit 1; }
+          "$VALIDATOR" "$VST" | tee validator.txt
 
           echo "VST_PATH=$VST" >> "$GITHUB_ENV"
 
-      - name: Collect artifact
+      - name: Stage package and verify roundtrip
         shell: bash
         run: |
           set -euo pipefail
+          rm -rf artifact verify-extract verify-preserve.zip
+          mkdir -p artifact verify-extract
 
-          mkdir -p artifact
           ditto "$VST_PATH" artifact/HarmonyEngine.vst3
 
+          # Verify the exact macOS package survives a normal ditto ZIP roundtrip.
           ditto -c -k --sequesterRsrc --keepParent \
-            artifact/HarmonyEngine.vst3 \
-            HARMONY-ENGINE-macOS-Intel-VST3.zip
-
-          rm -rf verify-extract
-          mkdir -p verify-extract
-          ditto -x -k HARMONY-ENGINE-macOS-Intel-VST3.zip verify-extract
+            artifact/HarmonyEngine.vst3 verify-preserve.zip
+          ditto -x -k verify-preserve.zip verify-extract
 
           test -d verify-extract/HarmonyEngine.vst3
-          test -x verify-extract/HarmonyEngine.vst3/Contents/MacOS/HarmonyEngine
           test -f verify-extract/HarmonyEngine.vst3/Contents/Info.plist
+          test -f verify-extract/HarmonyEngine.vst3/Contents/PkgInfo
+          test -f verify-extract/HarmonyEngine.vst3/Contents/MacOS/HarmonyEngine
+          test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundlePackageType' verify-extract/HarmonyEngine.vst3/Contents/Info.plist)" = 'BNDL'
+          codesign --verify --deep --strict --verbose=2 verify-extract/HarmonyEngine.vst3
 
-      - name: Upload Intel VST3
+          rm -rf verify-extract verify-preserve.zip
+
+      - name: Upload VST3 package directly
         uses: actions/upload-artifact@v4
         with:
           name: HARMONY-ENGINE-macOS-Intel-VST3
-          path: HARMONY-ENGINE-macOS-Intel-VST3.zip
+          path: artifact/
           if-no-files-found: error
           retention-days: 30
           compression-level: 0
