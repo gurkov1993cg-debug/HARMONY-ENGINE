@@ -62,6 +62,17 @@ jobs:
           path: vst3sdk
           submodules: recursive
 
+      - name: Audit locked iMac 2011 profile
+        shell: bash
+        run: |
+          set -euo pipefail
+          grep -q 'CMAKE_OSX_ARCHITECTURES "x86_64"' "$HARMONY_SOURCE/CMakeLists.txt"
+          grep -q 'CMAKE_OSX_DEPLOYMENT_TARGET "10.13"' "$HARMONY_SOURCE/CMakeLists.txt"
+          grep -q 'HARMONY_REQUIRED_VST3_SDK_VERSION "3.7.8"' "$HARMONY_SOURCE/CMakeLists.txt"
+          grep -q 'CFBundlePackageType' "$HARMONY_SOURCE/plugin/Info.plist.in"
+          grep -q '<string>BNDL</string>' "$HARMONY_SOURCE/plugin/Info.plist.in"
+          ! grep -Rni 'Vst::kDistributable' "$HARMONY_SOURCE/plugin/PluginFactory.cpp"
+
       - name: Verify Steinberg SDK
         shell: bash
         run: |
@@ -142,8 +153,8 @@ jobs:
           grep -qx 'HarmonyEngine' bundle-executable.txt
           /usr/libexec/PlistBuddy -c 'Print :CFBundleName' "$PLIST" | grep -qx 'Harmony Engine'
           /usr/libexec/PlistBuddy -c 'Print :CFBundleDisplayName' "$PLIST" | grep -qx 'Harmony Engine'
-          /usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$PLIST" | grep -qx '0.7.5'
-          /usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' "$PLIST" | grep -qx '0.7.5'
+          /usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$PLIST" | grep -qx '0.7.6'
+          /usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' "$PLIST" | grep -qx '0.7.6'
           test "$(cat "$PKGINFO")" = 'BNDL????' || {
             echo "ERROR: PkgInfo is not BNDL????"
             xxd "$PKGINFO" || true
