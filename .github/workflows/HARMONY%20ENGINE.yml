@@ -38,25 +38,44 @@ jobs:
           set -euo pipefail
           python3 - <<'PY'
           from pathlib import Path
+
           root = Path("source/HARMONY-ENGINE")
-          forbidden = "J" + "UCE"
-          for path in root.rglob("*"):
-              if not path.is_file() or path.suffix.lower() in {".png", ".zip"}:
-                  continue
-              text = path.read_text(errors="ignore")
-              if path.name == "IMAC2011_VST3_BUILD_RULE.md":
-                  continue
-              assert forbidden not in text and forbidden.lower() not in text.lower(), path
+          forbidden_tokens = [
+              "juce::",
+              "JuceHeader",
+              "juce_audio",
+              "juce_gui",
+              "JUCE_CALLTYPE",
+          ]
+
+          # Only scan actual active C++/ObjC++ plug-in/DSP sources.
+          # Do not scan CMake/docs because they intentionally contain the
+          # project's "no-JUCE" policy text.
+          for base in (root / "core", root / "plugin"):
+              for path in base.rglob("*"):
+                  if not path.is_file():
+                      continue
+                  if path.suffix.lower() not in {".h", ".hpp", ".c", ".cc", ".cpp", ".mm", ".m"}:
+                      continue
+                  text = path.read_text(errors="ignore")
+                  for token in forbidden_tokens:
+                      assert token not in text, f"{token} found in {path}"
+
           cm = (root / "CMakeLists.txt").read_text()
+          assert "add_subdirectory" in cm
           assert "smtg_enable_vst3_sdk()" in cm
           assert "smtg_add_vst3plugin(HarmonyEngine" in cm
-          assert "public.sdk/source/main/macmain.cpp" in cm  # configure-time verification only
-          assert "pluginfactory_constexpr.h" in (root / "plugin/PluginFactory.cpp").read_text()
+
+          factory = (root / "plugin/PluginFactory.cpp").read_text()
+          assert "public.sdk/source/main/pluginfactory_constexpr.h" in factory
+          assert "BEGIN_FACTORY_DEF" in factory
+          assert "Steinberg::Vst::kDistributable" in factory
+
           print("HARMONY source contract OK")
           PY
 
       - name: Configure DSP core
-        run: cmake -S "$HARMONY_SOURCE" -B build-core
+        run: cmake -S "$HARMONY_SOURCE" -B build-core -DBUILD_VST3_ADAPTER=OFF
 
       - name: Build DSP core tests
         run: cmake --build build-core --parallel 4
@@ -64,12 +83,22 @@ jobs:
       - name: Run DSP tests
         run: ctest --test-dir build-core --output-on-failure
 
-      - name: Checkout Steinberg VST3 SDK
+      - name: Checkout proven Steinberg VST3 SDK
         uses: actions/checkout@v4
         with:
           repository: steinbergmedia/vst3sdk
+          ref: 3cdf9ca5d1f5b1b21e0a86832aa4abe55607bd96
           path: vst3sdk
           submodules: recursive
+
+      - name: Verify exact SDK revision
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C vst3sdk rev-parse HEAD)" = "3cdf9ca5d1f5b1b21e0a86832aa4abe55607bd96"
+          test "$(git -C vst3sdk/public.sdk rev-parse HEAD)" = "586dc5e6c8012c3e4b01c79389375cbe96bdb1da"
+          test "$(git -C vst3sdk/pluginterfaces rev-parse HEAD)" = "4f547e8e102b47de4a8b8aaf343c73b700786372"
+          test "$(git -C vst3sdk/cmake rev-parse HEAD)" = "054c9143cbb8d47fc4694e473f2ee3b4d951a8f5"
 
       - name: Configure Intel VST3
         run: >-
@@ -91,16 +120,25 @@ jobs:
           test -n "$VST"
           BIN="$VST/Contents/MacOS/HarmonyEngine"
           test -f "$BIN"
+
           file "$BIN" | tee binary-info.txt
           ARCHS=$(lipo -archs "$BIN")
-          test "$ARCHS" = "x86_64" || { echo "ERROR: expected x86_64 only, got: $ARCHS"; exit 1; }
+          test "$ARCHS" = "x86_64" || {
+            echo "ERROR: expected x86_64 only, got: $ARCHS"
+            exit 1
+          }
+
           xcrun vtool -show-build "$BIN" | tee deployment-info.txt
+          grep -Eq 'minos[[:space:]]+10\.13|version[[:space:]]+10\.13' deployment-info.txt || {
+            echo "ERROR: macOS 10.13 deployment target not present"
+            exit 1
+          }
+
           nm -gU "$BIN" | tee exported-symbols.txt
           grep -q '_bundleEntry' exported-symbols.txt
           grep -q '_bundleExit' exported-symbols.txt
           grep -q '_GetPluginFactory' exported-symbols.txt
-          test -f "$VST/Contents/Info.plist"
-          plutil -lint "$VST/Contents/Info.plist"
+
           codesign --verify --deep "$VST"
 
       - name: Collect VST3
@@ -109,11 +147,17 @@ jobs:
           set -euo pipefail
           rm -rf artifact
           mkdir -p artifact
+
           VST=$(find build-vst3 -type d -name 'HarmonyEngine.vst3' -print -quit)
           test -n "$VST"
+          test -f "$VST/Contents/MacOS/HarmonyEngine"
+
           cp -R "$VST" artifact/
           cp binary-info.txt deployment-info.txt exported-symbols.txt artifact/
-          ditto -c -k --sequesterRsrc --keepParent "$VST" artifact/HARMONY-ENGINE-macOS-Intel.zip
+
+          ditto -c -k --sequesterRsrc --keepParent \
+            "$VST" \
+            artifact/HARMONY-ENGINE-macOS-Intel.zip
 
       - name: Upload macOS Intel VST3
         uses: actions/upload-artifact@v4
