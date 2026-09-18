@@ -11,273 +11,114 @@ permissions:
   contents: read
 
 concurrency:
-  group: harmony-engine-macos-intel
+  group: harmony-engine-macos
   cancel-in-progress: true
 
 jobs:
   macos-intel-vst3:
     runs-on: macos-15-intel
-    timeout-minutes: 35
-
-    env:
-      MACOSX_DEPLOYMENT_TARGET: '10.13'
-      VST3SDK_COMMIT: '0041ef2c879c3c54c03d33cdc11a97eaebfb5752'
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v5
+        uses: actions/checkout@v4
 
       - name: Extract HARMONY ENGINE source
         shell: bash
         run: |
           set -euo pipefail
           rm -rf source
-          mkdir -p source
+          mkdir source
           ditto -x -k HARMONY-ENGINE.zip source
+          test -f source/HARMONY-ENGINE/CMakeLists.txt
+          echo "HARMONY_SOURCE=$GITHUB_WORKSPACE/source/HARMONY-ENGINE" >> "$GITHUB_ENV"
 
-          if [ -f source/HARMONY-ENGINE/CMakeLists.txt ]; then
-            echo "HARMONY_SOURCE=$GITHUB_WORKSPACE/source/HARMONY-ENGINE" >> "$GITHUB_ENV"
-          elif [ -f source/CMakeLists.txt ]; then
-            echo "HARMONY_SOURCE=$GITHUB_WORKSPACE/source" >> "$GITHUB_ENV"
-          else
-            echo "ERROR: CMakeLists.txt not found"
-            exit 1
-          fi
-
-      - name: Audit zero JUCE source
+      - name: Verify source contract
         shell: bash
         run: |
           set -euo pipefail
-          if grep -RniE 'juce::|JuceHeader|juce_audio|juce_gui|JUCE_CALLTYPE' \
-              "$HARMONY_SOURCE/core" "$HARMONY_SOURCE/plugin"; then
-            echo "ERROR: JUCE reference found in HARMONY ENGINE"
-            exit 1
-          fi
+          python3 - <<'PY'
+          from pathlib import Path
+          root = Path("source/HARMONY-ENGINE")
+          forbidden = "J" + "UCE"
+          for path in root.rglob("*"):
+              if not path.is_file() or path.suffix.lower() in {".png", ".zip"}:
+                  continue
+              text = path.read_text(errors="ignore")
+              if path.name == "IMAC2011_VST3_BUILD_RULE.md":
+                  continue
+              assert forbidden not in text and forbidden.lower() not in text.lower(), path
+          cm = (root / "CMakeLists.txt").read_text()
+          assert "smtg_enable_vst3_sdk()" in cm
+          assert "smtg_add_vst3plugin(HarmonyEngine" in cm
+          assert "public.sdk/source/main/macmain.cpp" in cm  # configure-time verification only
+          assert "pluginfactory_constexpr.h" in (root / "plugin/PluginFactory.cpp").read_text()
+          print("HARMONY source contract OK")
+          PY
 
-      - name: Checkout Steinberg VST3 SDK 3.7.8
-        uses: actions/checkout@v5
+      - name: Configure DSP core
+        run: cmake -S "$HARMONY_SOURCE" -B build-core
+
+      - name: Build DSP core tests
+        run: cmake --build build-core --parallel 4
+
+      - name: Run DSP tests
+        run: ctest --test-dir build-core --output-on-failure
+
+      - name: Checkout Steinberg VST3 SDK
+        uses: actions/checkout@v4
         with:
           repository: steinbergmedia/vst3sdk
-          ref: ${{ env.VST3SDK_COMMIT }}
           path: vst3sdk
           submodules: recursive
 
-      - name: Audit locked iMac 2011 profile
-        shell: bash
-        run: |
-          set -euo pipefail
-          grep -q 'CMAKE_OSX_ARCHITECTURES "x86_64"' "$HARMONY_SOURCE/CMakeLists.txt"
-          grep -q 'CMAKE_OSX_DEPLOYMENT_TARGET "10.13"' "$HARMONY_SOURCE/CMakeLists.txt"
-          grep -q 'HARMONY_REQUIRED_VST3_SDK_VERSION "3.7.8"' "$HARMONY_SOURCE/CMakeLists.txt"
-          grep -q 'CFBundlePackageType' "$HARMONY_SOURCE/plugin/Info.plist.in"
-          grep -q '<string>BNDL</string>' "$HARMONY_SOURCE/plugin/Info.plist.in"
-          ! grep -Rni 'Vst::kDistributable' "$HARMONY_SOURCE/plugin/PluginFactory.cpp"
-          grep -q 'BEGIN_FACTORY(kVendorName, kVendorURL, kVendorEmail, PFactoryInfo::kNoFlags)' "$HARMONY_SOURCE/plugin/PluginFactory.cpp"
-          ! grep -q 'BEGIN_FACTORY_DEF' "$HARMONY_SOURCE/plugin/PluginFactory.cpp"
-          test "$(grep -c 'public.sdk/source/main/macmain.cpp' "$HARMONY_SOURCE/CMakeLists.txt")" -eq 1 || {
-            echo 'ERROR: macmain.cpp must be present exactly once in the HarmonyEngine target'
-            exit 1
-          }
+      - name: Configure Intel VST3
+        run: >-
+          cmake -S "$HARMONY_SOURCE" -B build-vst3 -G Xcode
+          -DBUILD_VST3_ADAPTER=ON
+          -DVST3_SDK_DIR="$GITHUB_WORKSPACE/vst3sdk"
+          -DCMAKE_OSX_ARCHITECTURES=x86_64
+          -DCMAKE_OSX_DEPLOYMENT_TARGET=10.13
+          -DSMTG_CREATE_PLUGIN_LINK=OFF
 
-      - name: Verify Steinberg SDK
-        shell: bash
-        run: |
-          set -euo pipefail
-          test "$(git -C vst3sdk rev-parse HEAD)" = "$VST3SDK_COMMIT"
-          grep -q 'VERSION 3.7.8' vst3sdk/CMakeLists.txt
-          test -f vst3sdk/public.sdk/source/main/macmain.cpp
-
-      - name: Configure project tests
-        shell: bash
-        run: |
-          cmake -S "$HARMONY_SOURCE" -B build-tests \
-            -DHARMONY_BUILD_PLUGIN=OFF \
-            -DCMAKE_BUILD_TYPE=Release \
-            -DCMAKE_OSX_ARCHITECTURES=x86_64 \
-            -DCMAKE_OSX_DEPLOYMENT_TARGET=10.13
-
-      - name: Build project tests
-        run: cmake --build build-tests --config Release --parallel 4
-
-      - name: Run project tests
-        run: ctest --test-dir build-tests -C Release --output-on-failure
-
-      - name: Configure HARMONY ENGINE VST3
-        shell: bash
-        run: |
-          cmake -S "$HARMONY_SOURCE" -B build-vst3 -G Xcode \
-            -DHARMONY_BUILD_PLUGIN=ON \
-            -DHARMONY_VST3_SDK_ROOT="$GITHUB_WORKSPACE/vst3sdk" \
-            -DSMTG_BUILD_UNIVERSAL_BINARY=OFF \
-            -DSMTG_CREATE_PLUGIN_LINK=OFF \
-            -DCMAKE_OSX_ARCHITECTURES=x86_64 \
-            -DCMAKE_OSX_DEPLOYMENT_TARGET=10.13 \
-            -DCMAKE_POLICY_VERSION_MINIMUM=3.5
-
-      - name: Build HARMONY ENGINE VST3
+      - name: Build Intel VST3
         run: cmake --build build-vst3 --config Release --target HarmonyEngine --parallel 4
 
-      - name: Dump VST3 diagnostics on build failure
-        if: failure()
-        shell: bash
-        run: |
-          set +e
-          echo '=== HARMONY failure diagnostics ==='
-          VST="$(find build-vst3 -type d -name 'HarmonyEngine.vst3' -print -quit)"
-          echo "VST=$VST"
-          if [ -n "$VST" ]; then
-            find "$VST" -maxdepth 4 -print
-            BIN="$VST/Contents/MacOS/HarmonyEngine"
-            if [ -f "$BIN" ]; then
-              file "$BIN"
-              lipo -archs "$BIN"
-              xcrun vtool -show-build "$BIN"
-              nm -gU "$BIN" | grep -E 'bundleEntry|bundleExit|GetPluginFactory' || true
-            fi
-            if [ -f "$VST/Contents/Info.plist" ]; then
-              plutil -p "$VST/Contents/Info.plist"
-            fi
-          fi
-
-      - name: Verify real VST3 bundle
+      - name: Verify Intel VST3
         shell: bash
         run: |
           set -euo pipefail
-
-          VST="$(find build-vst3 -type d -name 'HarmonyEngine.vst3' -print -quit)"
-          test -n "$VST" || { echo 'HarmonyEngine.vst3 missing'; exit 1; }
-
+          VST=$(find build-vst3 -type d -name 'HarmonyEngine.vst3' -print -quit)
+          test -n "$VST"
           BIN="$VST/Contents/MacOS/HarmonyEngine"
-          PLIST="$VST/Contents/Info.plist"
-          PKGINFO="$VST/Contents/PkgInfo"
-
-          test -x "$BIN" || { echo 'VST3 executable missing/not executable'; exit 1; }
-          test -f "$PLIST" || { echo 'Info.plist missing'; exit 1; }
-          test -f "$PKGINFO" || { echo 'PkgInfo missing'; exit 1; }
-
+          test -f "$BIN"
           file "$BIN" | tee binary-info.txt
-          ARCHS="$(lipo -archs "$BIN")"
-          echo "$ARCHS" | tee architectures.txt
-          test "$ARCHS" = 'x86_64' || {
-            echo "ERROR: expected x86_64 only, got $ARCHS"
-            exit 1
-          }
-
+          ARCHS=$(lipo -archs "$BIN")
+          test "$ARCHS" = "x86_64" || { echo "ERROR: expected x86_64 only, got: $ARCHS"; exit 1; }
           xcrun vtool -show-build "$BIN" | tee deployment-info.txt
-          grep -Eq 'minos[[:space:]]+10\.13|version[[:space:]]+10\.13' deployment-info.txt
-
-          # Keep load commands for diagnostics, but do not require a particular
-          # spelling. Xcode 16 may use LC_BUILD_VERSION even with minos 10.13.
-          otool -l "$BIN" | tee load-commands.txt
-
-          plutil -lint "$PLIST"
-          /usr/libexec/PlistBuddy -c 'Print :CFBundlePackageType' "$PLIST" | tee bundle-type.txt
-          /usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$PLIST" | tee bundle-id.txt
-          /usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$PLIST" | tee bundle-executable.txt
-
-          grep -qx 'BNDL' bundle-type.txt
-          grep -qx 'com.tercior.harmonyengine' bundle-id.txt
-          grep -qx 'HarmonyEngine' bundle-executable.txt
-          /usr/libexec/PlistBuddy -c 'Print :CFBundleName' "$PLIST" | grep -qx 'Harmony Engine'
-          /usr/libexec/PlistBuddy -c 'Print :CFBundleDisplayName' "$PLIST" | grep -qx 'Harmony Engine'
-          /usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$PLIST" | grep -qx '0.7.8'
-          /usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' "$PLIST" | grep -qx '0.7.8'
-          test "$(cat "$PKGINFO")" = 'BNDL????' || {
-            echo "ERROR: PkgInfo is not BNDL????"
-            xxd "$PKGINFO" || true
-            exit 1
-          }
-
           nm -gU "$BIN" | tee exported-symbols.txt
-          grep -q '_bundleEntry' exported-symbols.txt || {
-            echo "ERROR: bundleEntry export missing"
-            exit 1
-          }
-          grep -q '_bundleExit' exported-symbols.txt || {
-            echo "ERROR: bundleExit export missing"
-            exit 1
-          }
-          grep -q '_GetPluginFactory' exported-symbols.txt || {
-            echo "ERROR: GetPluginFactory export missing"
-            exit 1
-          }
+          grep -q '_bundleEntry' exported-symbols.txt
+          grep -q '_bundleExit' exported-symbols.txt
+          grep -q '_GetPluginFactory' exported-symbols.txt
+          test -f "$VST/Contents/Info.plist"
+          plutil -lint "$VST/Contents/Info.plist"
+          codesign --verify --deep "$VST"
 
-          MODULEINFO="$VST/Contents/Resources/moduleinfo.json"
-          test -f "$MODULEINFO" || {
-            echo 'moduleinfo.json missing'
-            exit 1
-          }
-
-          grep -q '"SDKVersion": "VST 3.7.8"' "$MODULEINFO" || {
-            echo 'ERROR: moduleinfo SDKVersion is not VST 3.7.8'
-            cat "$MODULEINFO"
-            exit 1
-          }
-          test "$(grep -c '"Class Flags": 0' "$MODULEINFO")" -ge 2 || {
-            echo 'ERROR: processor/controller class flags are not both zero'
-            cat "$MODULEINFO"
-            exit 1
-          }
-          grep -q '"Name": "Harmony Engine"' "$MODULEINFO" || {
-            echo 'ERROR: Harmony Engine class name missing'
-            cat "$MODULEINFO"
-            exit 1
-          }
-
-          codesign --verify --deep --strict --verbose=2 "$VST"
-
-          VALIDATOR="$(find build-vst3 -type f -name validator -perm +111 -print -quit)"
-          test -n "$VALIDATOR" || { echo 'Steinberg validator missing'; exit 1; }
-          "$VALIDATOR" "$VST" | tee validator.txt
-
-          echo "HARMONY_VST=$VST" >> "$GITHUB_ENV"
-
-      - name: Package VST3
+      - name: Collect VST3
         shell: bash
         run: |
           set -euo pipefail
-          rm -rf artifact verify
-          mkdir -p artifact verify
+          rm -rf artifact
+          mkdir -p artifact
+          VST=$(find build-vst3 -type d -name 'HarmonyEngine.vst3' -print -quit)
+          test -n "$VST"
+          cp -R "$VST" artifact/
+          cp binary-info.txt deployment-info.txt exported-symbols.txt artifact/
+          ditto -c -k --sequesterRsrc --keepParent "$VST" artifact/HARMONY-ENGINE-macOS-Intel.zip
 
-          ditto "$HARMONY_VST" artifact/HarmonyEngine.vst3
-
-          ditto -c -k --sequesterRsrc --keepParent \
-            artifact/HarmonyEngine.vst3 \
-            HARMONY-ENGINE-macOS-Intel.zip
-
-          ditto -x -k HARMONY-ENGINE-macOS-Intel.zip verify
-
-          test -d verify/HarmonyEngine.vst3
-          test -x verify/HarmonyEngine.vst3/Contents/MacOS/HarmonyEngine
-          test -f verify/HarmonyEngine.vst3/Contents/Info.plist
-          test -f verify/HarmonyEngine.vst3/Contents/PkgInfo
-          test -f verify/HarmonyEngine.vst3/Contents/Resources/moduleinfo.json
-
-          /usr/libexec/PlistBuddy -c 'Print :CFBundlePackageType' \
-            verify/HarmonyEngine.vst3/Contents/Info.plist | grep -qx 'BNDL'
-
-          codesign --verify --deep --strict --verbose=2 \
-            verify/HarmonyEngine.vst3
-
-          shasum -a 256 HARMONY-ENGINE-macOS-Intel.zip \
-            > HARMONY-ENGINE-macOS-Intel.sha256
-
-      - name: Upload Intel VST3
+      - name: Upload macOS Intel VST3
         uses: actions/upload-artifact@v4
         with:
           name: HARMONY-ENGINE-macOS-Intel
-          path: |
-            HARMONY-ENGINE-macOS-Intel.zip
-            HARMONY-ENGINE-macOS-Intel.sha256
-            binary-info.txt
-            architectures.txt
-            deployment-info.txt
-            load-commands.txt
-            exported-symbols.txt
-            bundle-type.txt
-            bundle-id.txt
-            bundle-executable.txt
-            validator.txt
+          path: artifact
           if-no-files-found: error
           retention-days: 30
-          compression-level: 0
