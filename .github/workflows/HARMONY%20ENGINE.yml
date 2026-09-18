@@ -72,6 +72,12 @@ jobs:
           grep -q 'CFBundlePackageType' "$HARMONY_SOURCE/plugin/Info.plist.in"
           grep -q '<string>BNDL</string>' "$HARMONY_SOURCE/plugin/Info.plist.in"
           ! grep -Rni 'Vst::kDistributable' "$HARMONY_SOURCE/plugin/PluginFactory.cpp"
+          grep -q 'BEGIN_FACTORY(kVendorName, kVendorURL, kVendorEmail, PFactoryInfo::kNoFlags)' "$HARMONY_SOURCE/plugin/PluginFactory.cpp"
+          ! grep -q 'BEGIN_FACTORY_DEF' "$HARMONY_SOURCE/plugin/PluginFactory.cpp"
+          test "$(grep -c 'public.sdk/source/main/macmain.cpp' "$HARMONY_SOURCE/CMakeLists.txt")" -eq 1 || {
+            echo 'ERROR: macmain.cpp must be present exactly once in the HarmonyEngine target'
+            exit 1
+          }
 
       - name: Verify Steinberg SDK
         shell: bash
@@ -111,6 +117,28 @@ jobs:
       - name: Build HARMONY ENGINE VST3
         run: cmake --build build-vst3 --config Release --target HarmonyEngine --parallel 4
 
+      - name: Dump VST3 diagnostics on build failure
+        if: failure()
+        shell: bash
+        run: |
+          set +e
+          echo '=== HARMONY failure diagnostics ==='
+          VST="$(find build-vst3 -type d -name 'HarmonyEngine.vst3' -print -quit)"
+          echo "VST=$VST"
+          if [ -n "$VST" ]; then
+            find "$VST" -maxdepth 4 -print
+            BIN="$VST/Contents/MacOS/HarmonyEngine"
+            if [ -f "$BIN" ]; then
+              file "$BIN"
+              lipo -archs "$BIN"
+              xcrun vtool -show-build "$BIN"
+              nm -gU "$BIN" | grep -E 'bundleEntry|bundleExit|GetPluginFactory' || true
+            fi
+            if [ -f "$VST/Contents/Info.plist" ]; then
+              plutil -p "$VST/Contents/Info.plist"
+            fi
+          fi
+
       - name: Verify real VST3 bundle
         shell: bash
         run: |
@@ -138,11 +166,9 @@ jobs:
           xcrun vtool -show-build "$BIN" | tee deployment-info.txt
           grep -Eq 'minos[[:space:]]+10\.13|version[[:space:]]+10\.13' deployment-info.txt
 
+          # Keep load commands for diagnostics, but do not require a particular
+          # spelling. Xcode 16 may use LC_BUILD_VERSION even with minos 10.13.
           otool -l "$BIN" | tee load-commands.txt
-          grep -q 'LC_VERSION_MIN_MACOSX' load-commands.txt || {
-            echo "ERROR: legacy LC_VERSION_MIN_MACOSX load command missing"
-            exit 1
-          }
 
           plutil -lint "$PLIST"
           /usr/libexec/PlistBuddy -c 'Print :CFBundlePackageType' "$PLIST" | tee bundle-type.txt
@@ -154,20 +180,25 @@ jobs:
           grep -qx 'HarmonyEngine' bundle-executable.txt
           /usr/libexec/PlistBuddy -c 'Print :CFBundleName' "$PLIST" | grep -qx 'Harmony Engine'
           /usr/libexec/PlistBuddy -c 'Print :CFBundleDisplayName' "$PLIST" | grep -qx 'Harmony Engine'
-          /usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$PLIST" | grep -qx '0.7.6'
-          /usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' "$PLIST" | grep -qx '0.7.6'
+          /usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$PLIST" | grep -qx '0.7.8'
+          /usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' "$PLIST" | grep -qx '0.7.8'
           test "$(cat "$PKGINFO")" = 'BNDL????' || {
             echo "ERROR: PkgInfo is not BNDL????"
             xxd "$PKGINFO" || true
             exit 1
           }
 
-          nm -gU "$BIN" | grep -q '_bundleEntry' || {
+          nm -gU "$BIN" | tee exported-symbols.txt
+          grep -q '_bundleEntry' exported-symbols.txt || {
             echo "ERROR: bundleEntry export missing"
             exit 1
           }
-          nm -gU "$BIN" | grep -q '_bundleExit' || {
+          grep -q '_bundleExit' exported-symbols.txt || {
             echo "ERROR: bundleExit export missing"
+            exit 1
+          }
+          grep -q '_GetPluginFactory' exported-symbols.txt || {
+            echo "ERROR: GetPluginFactory export missing"
             exit 1
           }
 
@@ -242,6 +273,7 @@ jobs:
             architectures.txt
             deployment-info.txt
             load-commands.txt
+            exported-symbols.txt
             bundle-type.txt
             bundle-id.txt
             bundle-executable.txt
