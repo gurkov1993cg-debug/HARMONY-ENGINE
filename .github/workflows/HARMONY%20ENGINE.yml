@@ -70,6 +70,7 @@ jobs:
           cmake -S "$PROJECT_ROOT" -B build-vst3 -G Xcode \
             -DHARMONY_BUILD_PLUGIN=ON \
             -DVST3_SDK_ROOT="$GITHUB_WORKSPACE/vst3sdk" \
+            -DSMTG_BUILD_UNIVERSAL_BINARY=OFF \
             -DCMAKE_OSX_ARCHITECTURES=x86_64 \
             -DCMAKE_OSX_DEPLOYMENT_TARGET=10.15 \
             -DSMTG_CREATE_PLUGIN_LINK=OFF
