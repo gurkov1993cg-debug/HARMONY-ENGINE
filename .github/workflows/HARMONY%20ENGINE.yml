@@ -105,7 +105,8 @@ jobs:
             -DSMTG_BUILD_UNIVERSAL_BINARY=OFF \
             -DSMTG_CREATE_PLUGIN_LINK=OFF \
             -DCMAKE_OSX_ARCHITECTURES=x86_64 \
-            -DCMAKE_OSX_DEPLOYMENT_TARGET=10.13
+            -DCMAKE_OSX_DEPLOYMENT_TARGET=10.13 \
+            -DCMAKE_POLICY_VERSION_MINIMUM=3.5
 
       - name: Build HARMONY ENGINE VST3
         run: cmake --build build-vst3 --config Release --target HarmonyEngine --parallel 4
