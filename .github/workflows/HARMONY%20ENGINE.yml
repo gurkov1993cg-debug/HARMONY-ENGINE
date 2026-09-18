@@ -20,8 +20,8 @@ jobs:
     timeout-minutes: 35
 
     env:
-      MACOSX_DEPLOYMENT_TARGET: '10.15'
-      VST3SDK_COMMIT: '3cdf9ca5d1f5b1b21e0a86832aa4abe55607bd96'
+      MACOSX_DEPLOYMENT_TARGET: '10.13'
+      VST3SDK_COMMIT: '0041ef2c879c3c54c03d33cdc11a97eaebfb5752'
 
     steps:
       - name: Checkout repository
@@ -54,7 +54,7 @@ jobs:
             exit 1
           fi
 
-      - name: Checkout Steinberg VST3 SDK 3.8.1
+      - name: Checkout Steinberg VST3 SDK 3.7.8
         uses: actions/checkout@v5
         with:
           repository: steinbergmedia/vst3sdk
@@ -67,7 +67,7 @@ jobs:
         run: |
           set -euo pipefail
           test "$(git -C vst3sdk rev-parse HEAD)" = "$VST3SDK_COMMIT"
-          grep -q 'VERSION 3.8.1' vst3sdk/CMakeLists.txt
+          grep -q 'VERSION 3.7.8' vst3sdk/CMakeLists.txt
           test -f vst3sdk/public.sdk/source/main/macmain.cpp
 
       - name: Configure project tests
@@ -77,7 +77,7 @@ jobs:
             -DHARMONY_BUILD_PLUGIN=OFF \
             -DCMAKE_BUILD_TYPE=Release \
             -DCMAKE_OSX_ARCHITECTURES=x86_64 \
-            -DCMAKE_OSX_DEPLOYMENT_TARGET=10.15
+            -DCMAKE_OSX_DEPLOYMENT_TARGET=10.13
 
       - name: Build project tests
         run: cmake --build build-tests --config Release --parallel 4
@@ -94,7 +94,7 @@ jobs:
             -DSMTG_BUILD_UNIVERSAL_BINARY=OFF \
             -DSMTG_CREATE_PLUGIN_LINK=OFF \
             -DCMAKE_OSX_ARCHITECTURES=x86_64 \
-            -DCMAKE_OSX_DEPLOYMENT_TARGET=10.15
+            -DCMAKE_OSX_DEPLOYMENT_TARGET=10.13
 
       - name: Build HARMONY ENGINE VST3
         run: cmake --build build-vst3 --config Release --target HarmonyEngine --parallel 4
@@ -124,7 +124,13 @@ jobs:
           }
 
           xcrun vtool -show-build "$BIN" | tee deployment-info.txt
-          grep -Eq 'minos[[:space:]]+10\.15|version[[:space:]]+10\.15' deployment-info.txt
+          grep -Eq 'minos[[:space:]]+10\.13|version[[:space:]]+10\.13' deployment-info.txt
+
+          otool -l "$BIN" | tee load-commands.txt
+          grep -q 'LC_VERSION_MIN_MACOSX' load-commands.txt || {
+            echo "ERROR: legacy LC_VERSION_MIN_MACOSX load command missing"
+            exit 1
+          }
 
           plutil -lint "$PLIST"
           /usr/libexec/PlistBuddy -c 'Print :CFBundlePackageType' "$PLIST" | tee bundle-type.txt
@@ -136,8 +142,8 @@ jobs:
           grep -qx 'HarmonyEngine' bundle-executable.txt
           /usr/libexec/PlistBuddy -c 'Print :CFBundleName' "$PLIST" | grep -qx 'Harmony Engine'
           /usr/libexec/PlistBuddy -c 'Print :CFBundleDisplayName' "$PLIST" | grep -qx 'Harmony Engine'
-          /usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$PLIST" | grep -qx '0.7.3'
-          /usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' "$PLIST" | grep -qx '0.7.3'
+          /usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$PLIST" | grep -qx '0.7.5'
+          /usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' "$PLIST" | grep -qx '0.7.5'
           test "$(cat "$PKGINFO")" = 'BNDL????' || {
             echo "ERROR: PkgInfo is not BNDL????"
             xxd "$PKGINFO" || true
@@ -153,8 +159,25 @@ jobs:
             exit 1
           }
 
-          test -f "$VST/Contents/Resources/moduleinfo.json" || {
+          MODULEINFO="$VST/Contents/Resources/moduleinfo.json"
+          test -f "$MODULEINFO" || {
             echo 'moduleinfo.json missing'
+            exit 1
+          }
+
+          grep -q '"SDKVersion": "VST 3.7.8"' "$MODULEINFO" || {
+            echo 'ERROR: moduleinfo SDKVersion is not VST 3.7.8'
+            cat "$MODULEINFO"
+            exit 1
+          }
+          test "$(grep -c '"Class Flags": 0' "$MODULEINFO")" -ge 2 || {
+            echo 'ERROR: processor/controller class flags are not both zero'
+            cat "$MODULEINFO"
+            exit 1
+          }
+          grep -q '"Name": "Harmony Engine"' "$MODULEINFO" || {
+            echo 'ERROR: Harmony Engine class name missing'
+            cat "$MODULEINFO"
             exit 1
           }
 
@@ -206,6 +229,7 @@ jobs:
             binary-info.txt
             architectures.txt
             deployment-info.txt
+            load-commands.txt
             bundle-type.txt
             bundle-id.txt
             bundle-executable.txt
